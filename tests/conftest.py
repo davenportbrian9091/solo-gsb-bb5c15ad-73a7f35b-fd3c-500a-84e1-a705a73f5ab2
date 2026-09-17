@@ -121,6 +121,27 @@ def _register_test_sinks(application) -> None:
             {"ok": False, "n": _fail_counts[event_id]}, status_code=500
         )
 
+    @application.post("/t/flaky")
+    async def t_flaky(request: FastAPIRequest, fail_times: int = 0):
+        # Records every delivery (like /t/record) but fails the first
+        # ``fail_times`` attempts of each event, then answers 200 — ideal
+        # for driving an event into the dead-letter queue before a replay.
+        body = await request.body()
+        event_id = request.headers.get("x-event-id", "?")
+        receipts.append(
+            {
+                "event_id": event_id,
+                "idempotency_key": request.headers.get("x-idempotency-key"),
+                "attempt": request.headers.get("x-delivery-attempt"),
+                "signature": request.headers.get("x-webhook-signature"),
+                "body": body.decode(),
+            }
+        )
+        _fail_counts[event_id] = _fail_counts.get(event_id, 0) + 1
+        if _fail_counts[event_id] <= fail_times:
+            return FastAPIJSONResponse({"ok": False}, status_code=500)
+        return FastAPIJSONResponse({"ok": True})
+
 
 
 @pytest.fixture

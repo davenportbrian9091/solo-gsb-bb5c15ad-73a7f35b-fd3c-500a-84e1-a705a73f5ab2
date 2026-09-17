@@ -240,3 +240,169 @@ def test_earlier_failure_blocks_later_event_until_it_dies(server):
     last_attempt_first = _parse_iso(final_first["attempts"][-1]["attempted_at"])
     first_attempt_second = _parse_iso(final_second["attempts"][0]["attempted_at"])
     assert last_attempt_first <= first_attempt_second
+
+
+# --------------------------------------------------------- dead-letter replay
+
+def test_replay_dead_event_requeues_and_delivers_with_full_history(server):
+    # fail_times=4: the first round dies after 4 attempts; the replayed
+    # round then succeeds on the (globally numbered) 5th attempt.
+    resp = _post_event(server.base_url, "/t/flaky", extra_query="?fail_times=4")
+    event_id = resp.json()["id"]
+    dead = wait_for(
+        lambda: (lambda e: e if e["status"] == "dead" else None)(
+            _get_event(server.base_url, event_id)
+        ),
+        timeout=30,
+    )
+    assert dead["attempts_count"] == 4
+    assert dead["replay_count"] == 0
+    assert dead["last_replayed_at"] is None
+
+    replay = httpx.post(f"{server.base_url}/events/{event_id}/replay")
+    assert replay.status_code == 200
+    replayed = replay.json()
+    assert replayed["status"] == "queued"
+    assert replayed["replay_count"] == 1
+    assert replayed["last_replayed_at"]
+    # Idempotency key, event id and attempt history are untouched.
+    assert replayed["id"] == event_id
+    assert replayed["idempotency_key"] == dead["idempotency_key"]
+    assert [a["attempt_no"] for a in replayed["attempts"]] == [1, 2, 3, 4]
+
+    final = wait_for(
+        lambda: (lambda e: e if e["status"] == "delivered" else None)(
+            _get_event(server.base_url, event_id)
+        ),
+        timeout=20,
+    )
+    assert final["attempts_count"] == 5
+    assert [a["attempt_no"] for a in final["attempts"]] == [1, 2, 3, 4, 5]
+    assert [a["status_code"] for a in final["attempts"]] == [500, 500, 500, 500, 200]
+    assert final["replay_count"] == 1
+    assert final["delivered_at"]
+
+    # The replayed delivery was signed and carried the continuous attempt
+    # number plus the unchanged idempotency key.
+    mine = [r for r in receipts if r["event_id"] == event_id]
+    assert len(mine) == 5
+    assert mine[-1]["attempt"] == "5"
+    assert mine[-1]["idempotency_key"] == dead["idempotency_key"]
+    assert mine[-1]["signature"] == _sign(mine[-1]["body"].encode())
+
+    # List responses expose the replay metadata too.
+    listed = httpx.get(
+        f"{server.base_url}/events", params={"status": "delivered"}
+    ).json()
+    entry = [e for e in listed["events"] if e["id"] == event_id]
+    assert entry and entry[0]["replay_count"] == 1
+    assert entry[0]["last_replayed_at"]
+
+
+def test_replay_starts_a_fresh_full_backoff_round(server):
+    resp = _post_event(server.base_url, "/t/fail-always")
+    event_id = resp.json()["id"]
+    wait_for(
+        lambda: (lambda e: e if e["status"] == "dead" else None)(
+            _get_event(server.base_url, event_id)
+        ),
+        timeout=30,
+    )
+
+    # Each replay grants a whole new round of 4 attempts (not an instant
+    # re-death), and replay_count accumulates.
+    for expected_replays in (1, 2):
+        replay = httpx.post(f"{server.base_url}/events/{event_id}/replay")
+        assert replay.status_code == 200
+        dead_again = wait_for(
+            lambda: (lambda e: e if e["status"] == "dead" else None)(
+                _get_event(server.base_url, event_id)
+            ),
+            timeout=30,
+        )
+        assert dead_again["replay_count"] == expected_replays
+        assert dead_again["attempts_count"] == 4 * (expected_replays + 1)
+
+    final = _get_event(server.base_url, event_id)
+    assert [a["attempt_no"] for a in final["attempts"]] == list(range(1, 13))
+    # The last round also followed the 1/2/4 backoff schedule.
+    times = [_parse_iso(a["attempted_at"]) for a in final["attempts"]]
+    gaps = [(times[i] - times[i - 1]).total_seconds() for i in range(9, 12)]
+    assert 0.9 <= gaps[0] <= 2.5, gaps
+    assert 1.8 <= gaps[1] <= 3.5, gaps
+    assert 3.6 <= gaps[2] <= 5.5, gaps
+
+
+def test_replay_rejects_non_dead_and_unknown_events(server):
+    from .conftest import _gates
+    token = f"replay-{uuid.uuid4().hex}"
+    _gates[token] = threading.Event()
+
+    blocked = _post_event(server.base_url, "/t/block", extra_query=f"?token={token}")
+    blocked_id = blocked.json()["id"]
+    wait_for(
+        lambda: _get_event(server.base_url, blocked_id)["status"] == "processing",
+        timeout=10,
+    )
+    queued = _post_event(server.base_url, "/t/block", extra_query=f"?token={token}")
+    queued_id = queued.json()["id"]
+    time.sleep(0.3)
+    assert _get_event(server.base_url, queued_id)["status"] == "queued"
+
+    try:
+        r = httpx.post(f"{server.base_url}/events/{blocked_id}/replay")
+        assert r.status_code == 409
+        assert "processing" in r.json()["detail"]
+
+        r = httpx.post(f"{server.base_url}/events/{queued_id}/replay")
+        assert r.status_code == 409
+        assert "queued" in r.json()["detail"]
+    finally:
+        httpx.post(f"{server.base_url}/t/release", params={"token": token})
+
+    wait_for(lambda: _get_event(server.base_url, blocked_id)["status"] == "delivered")
+    r = httpx.post(f"{server.base_url}/events/{blocked_id}/replay")
+    assert r.status_code == 409
+    assert "delivered" in r.json()["detail"]
+
+    r = httpx.post(f"{server.base_url}/events/{uuid.uuid4().hex}/replay")
+    assert r.status_code == 404
+    assert r.json()["detail"] == "event not found"
+
+
+def test_concurrent_replays_apply_exactly_once(server):
+    resp = _post_event(server.base_url, "/t/flaky", extra_query="?fail_times=4")
+    event_id = resp.json()["id"]
+    wait_for(
+        lambda: (lambda e: e if e["status"] == "dead" else None)(
+            _get_event(server.base_url, event_id)
+        ),
+        timeout=30,
+    )
+
+    codes: list[int] = []
+
+    def hit():
+        codes.append(httpx.post(f"{server.base_url}/events/{event_id}/replay").status_code)
+
+    threads = [threading.Thread(target=hit) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Exactly one replay wins; the rest are rejected and enqueue nothing.
+    assert codes.count(200) == 1
+    assert codes.count(409) == len(codes) - 1
+
+    final = wait_for(
+        lambda: (lambda e: e if e["status"] == "delivered" else None)(
+            _get_event(server.base_url, event_id)
+        ),
+        timeout=20,
+    )
+    assert final["replay_count"] == 1
+    assert final["attempts_count"] == 5
+    # No duplicate delivery resulted from the replay race.
+    mine = [r for r in receipts if r["event_id"] == event_id]
+    assert len(mine) == 5

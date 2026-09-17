@@ -12,6 +12,9 @@ services:
       WORKER_POLL_INTERVAL: "0.2"
       DELIVERY_TIMEOUT: "10"
     volumes:
+      # Persists events, delivery attempts and dead-letter/replay state
+      # (replay_count, last_replayed_at). Older databases are migrated in
+      # place on startup — the replay columns are added automatically.
       - webhook-data:/data
     restart: unless-stopped
 

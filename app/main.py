@@ -42,6 +42,8 @@ def _public_event(event: dict) -> dict:
         "attempts_count": event["attempts_count"],
         "created_at": event["created_at"],
         "delivered_at": event.get("delivered_at"),
+        "replay_count": event.get("replay_count", 0),
+        "last_replayed_at": event.get("last_replayed_at"),
         "attempts": event.get("attempts", []),
     }
 
@@ -73,8 +75,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Reliable Webhook Delivery API",
-    version="1.0.0",
-    description="Sign, enqueue, reliably deliver and inspect webhook events.",
+    version="1.1.0",
+    description="Sign, enqueue, reliably deliver, replay and inspect webhook events.",
     lifespan=lifespan,
 )
 
@@ -146,6 +148,30 @@ async def get_event(event_id: str):
     event = db.get_event(event_id)
     if event is None:
         raise HTTPException(status_code=404, detail="event not found")
+    return _public_event(event)
+
+
+@app.post("/events/{event_id}/replay")
+async def replay_event(event_id: str):
+    """Re-queue a dead-letter event for one fresh, full backoff round.
+
+    Only ``dead`` events are eligible. The event is flipped back to
+    ``queued`` in a single transaction, keeps its idempotency key and full
+    attempt history (``attempt_no`` continues counting up), increments
+    ``replay_count`` and is delivered again on the 1s/2s/4s schedule.
+    Concurrent duplicate replays are applied at most once — the losers get
+    409 and no extra delivery is enqueued.
+    """
+    try:
+        event = db.replay_event(event_id)
+    except KeyError:
+        raise HTTPException(status_code=404, detail="event not found")
+    except db.ReplayNotAllowedError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail="only dead-letter events can be replayed "
+            f"(current status: {exc.status})",
+        )
     return _public_event(event)
 
 

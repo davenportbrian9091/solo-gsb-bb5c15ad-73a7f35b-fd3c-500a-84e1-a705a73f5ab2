@@ -10,7 +10,8 @@
 - **幂等接收**：`idempotency_key` 在数据库中有唯一约束。重复提交返回**原事件**（HTTP 200，响应头 `Idempotent-Replay: true`），**不会再次入队或投递**。
 - **同一目标端点严格有序**：以创建顺序（SQLite `rowid`）为准，前一条事件未成功或进入死信前，后一条不会被取出投递。不同端点之间并行投递，互不阻塞。
 - **重试与死信**：首次立即投递；失败后分别等待 **1s / 2s / 4s** 重试（共 4 次尝试）；第 4 次仍失败（非 2xx、超时、连接错误）即进入死信（状态 `dead`）。
-- **事件查询**：返回每次尝试的时间、HTTP 响应码/错误信息，以及最终状态（`queued` / `processing` / `delivered` / `dead`）。
+- **死信重放**：`POST /events/{event_id}/replay` 仅接受 `dead` 事件，在一个事务内将其重新入队并开启**新一轮完整**的 1s/2s/4s 退避（再次享有 4 次尝试）。历史 `attempts` 全部保留、`attempt_no` 连续递增，`replay_count` 累计并记录 `last_replayed_at`，幂等键与事件 id 不变；并发重复重放只会生效一次，不会重复投递。
+- **事件查询**：返回每次尝试的时间、HTTP 响应码/错误信息、最终状态（`queued` / `processing` / `delivered` / `dead`），以及 `replay_count` / `last_replayed_at` 重放信息。
 - **崩溃恢复**：投递状态全部在 SQLite（WAL 模式）中，重启后把卡在 `processing` 的事件重新排队；出站请求携带 `X-Event-Id` / `X-Idempotency-Key`，投递语义为 at-least-once。
 - 内置一个实验用目标端点 `/dev/sink`，方便本地演示成功/失败/死信。
 
@@ -30,7 +31,8 @@ docker compose up --build
 | OpenAPI Schema | <http://localhost:8000/openapi.json> |
 
 宿主机端口 `8000`，容器内端口 `8000`（在 `docker-compose.yml` 的 `ports` 中可改）。
-数据持久化在命名卷 `webhook-data`（容器内 `/data/webhooks.db`）。
+数据（事件、投递尝试、死信与重放记录）持久化在命名卷 `webhook-data`（容器内
+`/data/webhooks.db`）；老版本数据库启动时会自动补齐重放相关列，无需手工迁移。
 
 生产环境请覆盖默认密钥：
 
@@ -93,6 +95,8 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
   "attempts_count": 4,
   "created_at": "2026-09-17T12:27:13.160640+00:00",
   "delivered_at": null,
+  "replay_count": 0,
+  "last_replayed_at": null,
   "attempts": [
     {"attempt_no": 1, "status_code": 500, "error": null, "attempted_at": "2026-09-17T12:27:13.333930+00:00"},
     {"attempt_no": 2, "status_code": 500, "error": null, "attempted_at": "2026-09-17T12:27:14.498397+00:00"},
@@ -101,6 +105,27 @@ X-Webhook-Signature: sha256=<HMAC_SHA256(secret, 原始请求体) 的十六进�
   ]
 }
 ```
+
+### 3. 重放死信事件 `POST /events/{event_id}/replay`
+
+仅允许 `status=dead` 的事件。服务在同一个事务里把事件重新置为 `queued`
+（`next_attempt_at=now`，首次尝试立即发生），并开启**新一轮完整**的 1s/2s/4s
+退避——即新一轮再次享有 4 次尝试，而不是立即再次进入死信。
+
+- 历史 `attempts` 全部保留，`attempt_no` 全局连续递增（如 4 次失败后重放，新尝试从 5 开始编号）
+- `replay_count` 加一，`last_replayed_at` 记录本次重放时间
+- 幂等键、事件 id、创建顺序（同端点有序性）均不变，出站签名与幂等头行为不变
+
+响应与错误：
+
+| 情况 | 状态码 |
+| --- | --- |
+| 重放成功，返回重放后的事件（`status=queued`） | `200` |
+| 事件不存在 | `404` |
+| 事件为 `queued` / `processing` / `delivered`（响应体说明当前状态） | `409` |
+
+并发重复重放由条件更新（`UPDATE … WHERE status='dead'`）保证只有一个请求生效，
+其余返回 `409`，**不会重复入队或重复投递**。
 
 ### 出站投递格式
 
@@ -136,6 +161,10 @@ BODY2="{\"idempotency_key\":\"${KEY}-fail\",\"target\":\"$BASE/dev/sink?fail_tim
 SIG2="sha256=$(printf '%s' "$BODY2" | openssl dgst -sha256 -hmac "${WEBHOOK_SECRET:-dev-secret-change-me}" | sed 's/^.* //')"
 curl -s -X POST "$BASE/events" -H "X-Webhook-Signature: $SIG2" -d "$BODY2"
 # 约 9 秒（1+2+4 退避）后 GET /events/key/... 可看到 4 条尝试与 status=dead
+
+# 重放死信事件：重新入队并开启新一轮完整退避（仅 status=dead 允许）
+DEAD_ID=$(curl -s "$BASE/events/key/${KEY}-fail" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
+curl -s -X POST "$BASE/events/$DEAD_ID/replay"
 ```
 
 Python 生成签名：
@@ -160,6 +189,11 @@ signature = "sha256=" + hmac.new(
 重试计划固定为 **1s、2s、4s**（首次失败后），共 4 次尝试；如需调整可修改
 `app/config.py` 中的 `RETRY_BACKOFF` / `MAX_ATTEMPTS`。
 
+死信重放的实现要点：`events` 表上的 `round_base_attempts` 记录本轮退避的起点；
+重放把它提升到当前 `attempts_count`，新一轮尝试的退避位置按轮内序号重新从 1s
+开始，而 `attempt_no` 保持全局连续。启动时会自动为老数据库补齐 `replay_count` /
+`last_replayed_at` / `round_base_attempts` 三列（`ALTER TABLE`，幂等），无需手工迁移。
+
 有序性实现要点：调度器在一个事务中只挑选每个目标端点上「创建最早且退避已到期」
 的事件并原子地置为 `processing`；更早的事件仍在 `queued`/`processing` 时，
 后续事件不会被选中，直到前者 `delivered` 或 `dead`。
@@ -172,14 +206,15 @@ python -m pytest tests/ -v
 ```
 
 测试启动真实 uvicorn 端口，端到端覆盖：签名校验（缺失/错误/篡改）、成功投递与查询、
-幂等不重复入队、1/2/4 秒退避后死信、失败后恢复、同端点严格有序（含前序失败阻塞后序直到死信）。
+幂等不重复入队、1/2/4 秒退避后死信、失败后恢复、同端点严格有序（含前序失败阻塞后序直到死信）、
+死信重放（完整新退避轮次、历史保留与连续编号、replay_count 累计、非死信 409/未知 404、并发重放仅生效一次）。
 
 ## 项目结构
 
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：签名校验、事件接收、查询、dev sink
+│   ├── main.py        # FastAPI 路由：签名校验、事件接收、查询、死信重放、dev sink
 │   ├── config.py      # 环境变量配置
 │   ├── db.py          # SQLite 表结构、状态机、有序 claim/幂等查询
 │   ├── delivery.py    # 出站 HTTP 投递与 HMAC 签名

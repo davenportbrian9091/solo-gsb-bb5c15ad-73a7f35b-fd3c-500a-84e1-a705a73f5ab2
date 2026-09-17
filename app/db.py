@@ -21,8 +21,20 @@ from . import config
 #   queued     - waiting for the first attempt or a retry
 #   processing - an HTTP attempt is in flight (at most one per endpoint)
 #   delivered  - got a 2xx response (terminal)
-#   dead       - all attempts exhausted, moved to the dead-letter queue (terminal)
+#   dead       - all attempts of the current round exhausted (dead-letter);
+#                terminal unless replayed, which starts a fresh backoff round
 TERMINAL_STATUSES = ("delivered", "dead")
+
+
+class ReplayNotAllowedError(Exception):
+    """Raised when a replay is requested for an event that is not dead."""
+
+    def __init__(self, event_id: str, status: str) -> None:
+        self.event_id = event_id
+        self.status = status
+        super().__init__(
+            f"event {event_id} is '{status}'; only dead-letter events can be replayed"
+        )
 
 db_lock = threading.RLock()
 _conn: sqlite3.Connection | None = None
@@ -58,7 +70,10 @@ def init_db() -> None:
                 attempts_count  INTEGER NOT NULL DEFAULT 0,
                 created_at      TEXT NOT NULL,
                 next_attempt_at REAL,
-                delivered_at    TEXT
+                delivered_at    TEXT,
+                replay_count    INTEGER NOT NULL DEFAULT 0,
+                last_replayed_at TEXT,
+                round_base_attempts INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS attempts (
@@ -76,7 +91,26 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_attempts_event ON attempts(event_id);
             """
         )
+        _migrate_events(conn)
         conn.commit()
+
+
+def _migrate_events(conn: sqlite3.Connection) -> None:
+    """Add replay columns to databases created before replay existed.
+
+    ``CREATE TABLE IF NOT EXISTS`` leaves pre-existing files untouched, so
+    the new columns are added idempotently here. Existing rows receive the
+    defaults (``replay_count=0``, ``round_base_attempts=0``), which keeps
+    their behaviour identical to the pre-replay state machine.
+    """
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
+    for column, ddl in (
+        ("replay_count", "replay_count INTEGER NOT NULL DEFAULT 0"),
+        ("last_replayed_at", "last_replayed_at TEXT"),
+        ("round_base_attempts", "round_base_attempts INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if column not in existing:
+            conn.execute(f"ALTER TABLE events ADD COLUMN {ddl}")
 
 
 def reset_stuck_events() -> None:
@@ -178,8 +212,12 @@ def record_attempt(
     """Persist one finished attempt and advance the event state machine.
 
     2xx          -> delivered
-    other / n    -> queued with next backoff (1s, 2s, 4s after attempts
-                   1, 2, 3), or dead after the 4th failed attempt.
+    other / none -> queued with the next backoff of the current round
+                    (1s, 2s, 4s after round attempts 1, 2, 3), or dead
+                    after the 4th failed attempt of the round. Replaying
+                    a dead event starts a new round: ``attempt_no`` keeps
+                    counting up globally, but the backoff schedule and the
+                    dead-letter cut-off are relative to the round.
     """
     with db_lock:
         conn = get_conn()
@@ -190,6 +228,7 @@ def record_attempt(
             raise KeyError(event_id)
         event = dict(row)
         attempt_no = event["attempts_count"] + 1
+        round_attempt = attempt_no - event["round_base_attempts"]
 
         conn.execute(
             "INSERT INTO attempts "
@@ -205,19 +244,59 @@ def record_attempt(
                 "next_attempt_at = NULL, delivered_at = ? WHERE id = ?",
                 (attempt_no, _iso(), event_id),
             )
-        elif attempt_no >= config.MAX_ATTEMPTS:
+        elif round_attempt >= config.MAX_ATTEMPTS:
             conn.execute(
                 "UPDATE events SET status = 'dead', attempts_count = ?, "
                 "next_attempt_at = NULL WHERE id = ?",
                 (attempt_no, event_id),
             )
         else:
-            delay = config.RETRY_BACKOFF[attempt_no - 1]
+            delay = config.RETRY_BACKOFF[round_attempt - 1]
             conn.execute(
                 "UPDATE events SET status = 'queued', attempts_count = ?, "
                 "next_attempt_at = ? WHERE id = ?",
                 (attempt_no, time.time() + delay, event_id),
             )
+        conn.commit()
+        return get_event(event_id)
+
+
+def replay_event(event_id: str) -> dict:
+    """Re-queue a dead-letter event for one fresh, full backoff round.
+
+    The ``dead -> queued`` flip is a single conditional UPDATE (one
+    transaction): concurrent replays — even from another process — cannot
+    both win, because the loser updates zero rows and gets
+    ``ReplayNotAllowedError``. A replay can therefore never enqueue or
+    deliver the event twice.
+
+    Attempt history is kept untouched: ``attempt_no`` keeps counting up
+    (5, 6, …), while ``round_base_attempts`` is lifted to the current
+    ``attempts_count`` so the new round restarts the 1s/2s/4s schedule and
+    grants a full set of attempts again. The idempotency key, event id and
+    creation order (rowid) are not touched, so per-endpoint ordering and
+    outbound idempotency headers are unchanged.
+    """
+    with db_lock:
+        conn = get_conn()
+        row = conn.execute(
+            "SELECT * FROM events WHERE id = ?", (event_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(event_id)
+        if row["status"] != "dead":
+            raise ReplayNotAllowedError(event_id, row["status"])
+        cur = conn.execute(
+            "UPDATE events SET status = 'queued', next_attempt_at = ?, "
+            "replay_count = replay_count + 1, last_replayed_at = ?, "
+            "round_base_attempts = attempts_count "
+            "WHERE id = ? AND status = 'dead'",
+            (time.time(), _iso(), event_id),
+        )
+        if cur.rowcount != 1:
+            # Lost a cross-process replay race between SELECT and UPDATE.
+            conn.rollback()
+            raise ReplayNotAllowedError(event_id, "queued")
         conn.commit()
         return get_event(event_id)
 
