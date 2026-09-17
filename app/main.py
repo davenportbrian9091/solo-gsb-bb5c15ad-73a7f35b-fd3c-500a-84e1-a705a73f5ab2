@@ -40,8 +40,10 @@ def _public_event(event: dict) -> dict:
         "payload": event["payload"],
         "status": event["status"],
         "attempts_count": event["attempts_count"],
+        "replay_count": event["replay_count"],
         "created_at": event["created_at"],
         "delivered_at": event.get("delivered_at"),
+        "last_replayed_at": event.get("last_replayed_at"),
         "attempts": event.get("attempts", []),
     }
 
@@ -146,6 +148,28 @@ async def get_event(event_id: str):
     event = db.get_event(event_id)
     if event is None:
         raise HTTPException(status_code=404, detail="event not found")
+    return _public_event(event)
+
+
+@app.post("/events/{event_id}/replay")
+async def replay_event(event_id: str):
+    """Re-queue a dead-letter event for a fresh round of delivery attempts.
+
+    Only ``dead`` events are accepted: the event keeps its idempotency key,
+    target, payload and full attempt history, ``replay_count`` is
+    incremented, and a complete backoff round starts (immediate first
+    attempt, then 1s/2s/4s retries, dead again after the 4th failure).
+    Unknown ids get 404, events in any other status get 409. Concurrent
+    replays are safe: exactly one of them re-queues the event.
+    """
+    event, error = db.replay_event(event_id)
+    if error == "not_found":
+        raise HTTPException(status_code=404, detail="event not found")
+    if error is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"only dead events can be replayed (current status: {error})",
+        )
     return _public_event(event)
 
 

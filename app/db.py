@@ -21,7 +21,8 @@ from . import config
 #   queued     - waiting for the first attempt or a retry
 #   processing - an HTTP attempt is in flight (at most one per endpoint)
 #   delivered  - got a 2xx response (terminal)
-#   dead       - all attempts exhausted, moved to the dead-letter queue (terminal)
+#   dead       - all attempts of the round exhausted, dead-lettered
+#                (terminal until re-queued via replay_event)
 TERMINAL_STATUSES = ("delivered", "dead")
 
 db_lock = threading.RLock()
@@ -50,15 +51,18 @@ def init_db() -> None:
         conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS events (
-                id              TEXT PRIMARY KEY,
-                idempotency_key TEXT NOT NULL UNIQUE,
-                target          TEXT NOT NULL,
-                payload         TEXT NOT NULL,
-                status          TEXT NOT NULL DEFAULT 'queued',
-                attempts_count  INTEGER NOT NULL DEFAULT 0,
-                created_at      TEXT NOT NULL,
-                next_attempt_at REAL,
-                delivered_at    TEXT
+                id                  TEXT PRIMARY KEY,
+                idempotency_key     TEXT NOT NULL UNIQUE,
+                target              TEXT NOT NULL,
+                payload             TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'queued',
+                attempts_count      INTEGER NOT NULL DEFAULT 0,
+                replay_count        INTEGER NOT NULL DEFAULT 0,
+                round_base_attempts INTEGER NOT NULL DEFAULT 0,
+                created_at          TEXT NOT NULL,
+                next_attempt_at     REAL,
+                delivered_at        TEXT,
+                last_replayed_at    TEXT
             );
 
             CREATE TABLE IF NOT EXISTS attempts (
@@ -76,7 +80,30 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_attempts_event ON attempts(event_id);
             """
         )
+        _apply_migrations(conn)
         conn.commit()
+
+
+# Columns introduced after the initial schema. ``init_db`` backfills them
+# into databases created by older versions, so an existing data volume can
+# be upgraded in place without any manual migration step.
+_EVENT_COLUMN_MIGRATIONS = {
+    "replay_count":
+        "ALTER TABLE events ADD COLUMN replay_count INTEGER NOT NULL DEFAULT 0",
+    "last_replayed_at":
+        "ALTER TABLE events ADD COLUMN last_replayed_at TEXT",
+    "round_base_attempts":
+        "ALTER TABLE events ADD COLUMN round_base_attempts "
+        "INTEGER NOT NULL DEFAULT 0",
+}
+
+
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Add columns that pre-replay databases are missing (idempotent)."""
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(events)")}
+    for column, ddl in _EVENT_COLUMN_MIGRATIONS.items():
+        if column not in existing:
+            conn.execute(ddl)
 
 
 def reset_stuck_events() -> None:
@@ -178,8 +205,13 @@ def record_attempt(
     """Persist one finished attempt and advance the event state machine.
 
     2xx          -> delivered
-    other / n    -> queued with next backoff (1s, 2s, 4s after attempts
-                   1, 2, 3), or dead after the 4th failed attempt.
+    other / n    -> queued with the next backoff of the current round (1s,
+                   2s, 4s after round attempts 1, 2, 3), or dead after the
+                   4th failed attempt of the round. ``attempt_no`` keeps
+                   increasing across replays; only the round-relative count
+                   (attempts since ``round_base_attempts``) drives the
+                   backoff schedule and the dead-letter threshold, so a
+                   replayed event gets a full fresh round.
     """
     with db_lock:
         conn = get_conn()
@@ -190,6 +222,7 @@ def record_attempt(
             raise KeyError(event_id)
         event = dict(row)
         attempt_no = event["attempts_count"] + 1
+        round_attempt = attempt_no - event["round_base_attempts"]
 
         conn.execute(
             "INSERT INTO attempts "
@@ -205,14 +238,14 @@ def record_attempt(
                 "next_attempt_at = NULL, delivered_at = ? WHERE id = ?",
                 (attempt_no, _iso(), event_id),
             )
-        elif attempt_no >= config.MAX_ATTEMPTS:
+        elif round_attempt >= config.MAX_ATTEMPTS:
             conn.execute(
                 "UPDATE events SET status = 'dead', attempts_count = ?, "
                 "next_attempt_at = NULL WHERE id = ?",
                 (attempt_no, event_id),
             )
         else:
-            delay = config.RETRY_BACKOFF[attempt_no - 1]
+            delay = config.RETRY_BACKOFF[round_attempt - 1]
             conn.execute(
                 "UPDATE events SET status = 'queued', attempts_count = ?, "
                 "next_attempt_at = ? WHERE id = ?",
@@ -220,6 +253,39 @@ def record_attempt(
             )
         conn.commit()
         return get_event(event_id)
+
+
+def replay_event(event_id: str) -> tuple[dict | None, str | None]:
+    """Re-queue a dead-letter event for a fresh delivery round.
+
+    The idempotency key, target, payload and the whole attempt history are
+    kept; ``replay_count`` is incremented and the backoff schedule restarts
+    from the beginning of a new round (``round_base_attempts`` is moved to
+    the current ``attempts_count``). The event re-joins its endpoint's
+    ordered queue at its original creation position.
+
+    Returns ``(event, None)`` on success, ``(None, "not_found")`` when the
+    id does not exist, or ``(None, status)`` when the event is not dead.
+    The conditional UPDATE is the concurrency guard: exactly one of several
+    concurrent replays flips ``dead`` -> ``queued``, so the event is
+    re-enqueued -- and therefore redelivered -- exactly once per replay.
+    """
+    with db_lock:
+        conn = get_conn()
+        cursor = conn.execute(
+            "UPDATE events SET status = 'queued', next_attempt_at = ?, "
+            "replay_count = replay_count + 1, last_replayed_at = ?, "
+            "round_base_attempts = attempts_count "
+            "WHERE id = ? AND status = 'dead'",
+            (time.time(), _iso(), event_id),
+        )
+        if cursor.rowcount == 0:
+            row = conn.execute(
+                "SELECT status FROM events WHERE id = ?", (event_id,)
+            ).fetchone()
+            return (None, "not_found") if row is None else (None, row["status"])
+        conn.commit()
+        return get_event(event_id), None
 
 
 def _attempts_for(conn: sqlite3.Connection, event_id: str) -> list[dict]:

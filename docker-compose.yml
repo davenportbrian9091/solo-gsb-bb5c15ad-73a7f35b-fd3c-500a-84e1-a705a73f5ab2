@@ -12,6 +12,9 @@ services:
       WORKER_POLL_INTERVAL: "0.2"
       DELIVERY_TIMEOUT: "10"
     volumes:
+      # Existing volumes upgrade in place: startup migrations automatically
+      # add any missing columns (e.g. replay_count for dead-letter replay)
+      # to databases created by older versions.
       - webhook-data:/data
     restart: unless-stopped
 
